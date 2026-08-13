@@ -1,0 +1,12 @@
+{
+  "rewrites": [
+    {
+      "source": "/youcam-api/:match*",
+      "destination": "https://yce-api-01.makeupar.com/:match*"
+    },
+    {
+      "source": "/(.*)",
+      "destination": "/index.html"
+    }
+  ]
+}
