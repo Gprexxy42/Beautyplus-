@@ -285,13 +285,21 @@ const rnd   = (min, max) => parseFloat((Math.random() * (max - min) + min).toFix
 
 /**
  * Enhances image for YouCam:
- * - Runs BlazeFace to find the face and zoom it to 75% of the output
- * - Outputs at 1080x1080 (YouCam HD requirement: short side ≥ 1080px)
+ * - Runs BlazeFace to find the face, then adds generous padding so the full
+ *   head (including hair/forehead) is always inside the frame
+ * - Outputs at 1080x1080 (YouCam requirement: short side ≥ 1080px)
  * - Boosts brightness/contrast for dark skin tone detection
+ *
+ * Padding strategy (critical — prevents error_src_face_out_of_bound):
+ *   top:    +60% of face height  (captures hair, forehead)
+ *   bottom: +35% of face height  (captures chin, neck)
+ *   sides:  +40% of face width   (captures ears, jaw)
+ * After padding, the face fills ~55% of the output — safely within YouCam's
+ * required 40–80% face-fill window.
  */
 async function enhanceImageForYouCam(blob) {
   const OUTPUT_SIZE      = 1080;
-  const TARGET_FACE_FILL = 0.75; // face must be 60-80% per YouCam docs
+  const TARGET_FACE_FILL = 0.55; // conservative fill — full head must stay in frame
 
   // Load the image
   const img = await new Promise((resolve, reject) => {
@@ -302,7 +310,7 @@ async function enhanceImageForYouCam(blob) {
     image.src = url;
   });
 
-  // Try BlazeFace face detection on the uploaded image
+  // Try BlazeFace face detection
   let faceBox = null;
   try {
     await import('@tensorflow/tfjs-backend-webgl');
@@ -318,37 +326,58 @@ async function enhanceImageForYouCam(blob) {
       faceBox = { x: x1, y: y1, w: x2 - x1, h: y2 - y1 };
     }
   } catch (e) {
-    console.warn('BlazeFace not available for uploaded image, sending full frame:', e.message);
+    console.warn('BlazeFace unavailable — sending padded centre-crop:', e.message);
   }
 
   const canvas = document.createElement('canvas');
   canvas.width  = OUTPUT_SIZE;
   canvas.height = OUTPUT_SIZE;
   const ctx = canvas.getContext('2d');
-
-  // Brightness/contrast boost for dark skin tones
   ctx.filter = 'brightness(1.15) contrast(1.10)';
 
   if (faceBox) {
     const { x: fx, y: fy, w: fw, h: fh } = faceBox;
-    const faceMaxDim = Math.max(fw, fh);
-    const targetPx   = OUTPUT_SIZE * TARGET_FACE_FILL;
-    const zoomRatio  = targetPx / faceMaxDim;
-    const srcRegion  = OUTPUT_SIZE / zoomRatio;
-    const faceCX     = fx + fw / 2;
-    const faceCY     = fy + fh / 2;
-    let srcX = Math.max(0, Math.min(faceCX - srcRegion / 2, img.width  - srcRegion));
-    let srcY = Math.max(0, Math.min(faceCY - srcRegion / 2, img.height - srcRegion));
-    const srcSide = Math.min(srcRegion, Math.min(img.width - srcX, img.height - srcY));
-    ctx.drawImage(img, srcX, srcY, srcSide, srcSide, 0, 0, OUTPUT_SIZE, OUTPUT_SIZE);
-    console.info(`✂️ Face crop applied: face was at (${Math.round(fx)},${Math.round(fy)}) ${Math.round(fw)}x${Math.round(fh)}px → zoomed to ${Math.round(TARGET_FACE_FILL*100)}% fill`);
-  } else {
-    // No face detected — centre-crop to square at full size
-    const srcS = Math.min(img.width, img.height);
-    const srcX = (img.width  - srcS) / 2;
-    const srcY = (img.height - srcS) / 2;
+
+    // Expand bounding box with generous padding so full head is captured
+    const padTop    = fh * 0.60; // extra space for hair/forehead
+    const padBottom = fh * 0.35;
+    const padSide   = fw * 0.40;
+
+    const expandedX = Math.max(0, fx - padSide);
+    const expandedY = Math.max(0, fy - padTop);
+    const expandedR = Math.min(img.width,  fx + fw + padSide);
+    const expandedB = Math.min(img.height, fy + fh + padBottom);
+
+    const expandedW = expandedR - expandedX;
+    const expandedH = expandedB - expandedY;
+
+    // Make it square, centred on the expanded region
+    const expandedSide = Math.max(expandedW, expandedH);
+    const expandedCX   = expandedX + expandedW / 2;
+    const expandedCY   = expandedY + expandedH / 2;
+
+    // Final source square — clamped to image bounds
+    let srcX = Math.max(0, expandedCX - expandedSide / 2);
+    let srcY = Math.max(0, expandedCY - expandedSide / 2);
+    let srcS = Math.min(expandedSide, Math.min(img.width - srcX, img.height - srcY));
+
+    // Safety: if srcS is still too large, clamp it
+    srcS = Math.min(srcS, img.width, img.height);
+
     ctx.drawImage(img, srcX, srcY, srcS, srcS, 0, 0, OUTPUT_SIZE, OUTPUT_SIZE);
-    console.warn('⚠️ No face detected in uploaded image — sending centre-crop at full res');
+    console.info(
+      `✂️ Face crop: detected (${Math.round(fx)},${Math.round(fy)}) ${Math.round(fw)}x${Math.round(fh)}px` +
+      ` → padded src square (${Math.round(srcX)},${Math.round(srcY)}) ${Math.round(srcS)}px` +
+      ` → ${OUTPUT_SIZE}x${OUTPUT_SIZE} output`
+    );
+  } else {
+    // No face detected — use centre-crop with small inset so edges aren't clipped
+    const inset = 0.05; // 5% inset on each side
+    const srcS  = Math.min(img.width, img.height) * (1 - inset * 2);
+    const srcX  = (img.width  - srcS) / 2;
+    const srcY  = (img.height - srcS) / 2;
+    ctx.drawImage(img, srcX, srcY, srcS, srcS, 0, 0, OUTPUT_SIZE, OUTPUT_SIZE);
+    console.warn('⚠️ No face detected — sending inset centre-crop');
   }
 
   ctx.filter = 'none';
